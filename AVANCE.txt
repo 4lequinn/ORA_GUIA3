@@ -1,0 +1,575 @@
+
+
+
+-- CASO 1
+
+-----------------------------------------------
+
+
+-- ACTIVAMOS SALIDA DE DBMS
+SET SERVEROUTPUT ON;
+
+-- creación de package 
+-- ENCABEZADO
+
+CREATE OR REPLACE PACKAGE PKG_PROCESOS IS 
+    -- DECLARAMOS LAS VARIABLES O SUBPROGRAMAS PÚBLICOS
+    v_reajuste NUMBER(8);
+    
+    PROCEDURE SP_ERRORES (p_rutina_error ERROR_PROCESO.RUTINA_ERROR%TYPE, p_mensaje ERROR_PROCESO.mensaje_error%type);
+    
+    PROCEDURE SP_TRUNCA_TABLA(p_nombre VARCHAR2); 
+    
+    FUNCTION FN_CALC_CRED (p_nro_socio SOCIO.nro_socio%type, p_fecha_proceso DATE) RETURN NUMBER;
+    
+END PKG_PROCESOS;
+/
+-- Creación de package body
+
+CREATE OR REPLACE PACKAGE BODY PKG_PROCESOS IS 
+      
+    PROCEDURE SP_ERRORES (p_rutina_error ERROR_PROCESO.RUTINA_ERROR%TYPE, p_mensaje ERROR_PROCESO.mensaje_error%type) IS
+        v_sql VARCHAR2(100);
+    BEGIN
+        v_sql := 'INSERT INTO ERROR_PROCESO VALUES (SEQ_ERROR_PROC.NEXTVAL,:p_rutina_error,:p_mensaje)';
+        EXECUTE IMMEDIATE V_SQL USING p_rutina_error, p_mensaje;
+        
+    END SP_ERRORES;
+    
+    FUNCTION FN_CALC_CRED (p_nro_socio SOCIO.nro_socio%type, p_fecha_proceso DATE) RETURN NUMBER IS
+        V_CANTIDAD number(2) DEFAULT 0;
+        v_comando VARCHAR2(200);
+    BEGIN
+        
+        -- RESCATAMOS LOS CREDITOS SOLICITADOS
+        v_comando := 
+        'SELECT NVL(COUNT(*) ,0) 
+        FROM CREDITO_SOCIO
+        WHERE nro_socio = :p_nro_socio
+        AND TO_CHAR(fecha_solic_cred,''YYYY'') = to_char(:p_fecha_proceso,''YYYY'')';
+        
+        -- SQL DINÁMICO NATIVO
+        EXECUTE IMMEDIATE v_comando INTO V_CANTIDAD USING p_nro_socio, p_fecha_proceso;
+        
+        RETURN V_CANTIDAD;
+    EXCEPTION 
+        WHEN OTHERS THEN
+            RETURN 0;
+    END FN_CALC_CRED;
+    
+    
+    PROCEDURE SP_TRUNCA_TABLA (P_NOMBRE VARCHAR2) IS
+    BEGIN
+        EXECUTE IMMEDIATE 'TRUNCATE TABLE ' || P_nombre;
+    END SP_TRUNCA_TABLA;
+END PKG_PROCESOS;
+/
+
+
+-- PRUEBA DE FN
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('CANTIDAD : ' || ' ' ||PKG_PROCESOS.FN_CALC_CRED(90,SYSDATE));
+END;
+/
+
+-- Función almacenada
+
+CREATE OR REPLACE FUNCTION FN_OBTENER_TPRODUCTO (p_nro_socio SOCIO.nro_socio%type) RETURN NUMBER IS
+    V_cantidad NUMBER(2) := 0;
+    v_comando VARCHAR2(200);
+BEGIN
+    v_comando := 'SELECT NVL(count(*),0) 
+                            FROM producto_inversion_socio
+                            WHERE nro_socio = :1';
+                            
+    EXECUTE IMMEDIATE v_comando INTO v_cantidad USING p_nro_socio;
+    
+    RETURN V_cantidad;
+EXCEPTION 
+    WHEN OTHERS THEN
+        RETURN 0;
+END FN_OBTENER_TPRODUCTO;
+/
+
+DROP TABLE producto_inv_bk;
+/
+-- BACKUP DE LA TABLA PRODUCTO_INVERSION_SOCIO
+CREATE TABLE producto_inv_bk AS SELECT * FROM PRODUCTO_INVERSION_SOCIO;
+/
+
+-- Permite usar valores decimales como parametros en los procedimientos almacenados
+ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,';
+
+/*
+ño de proceso: año actual.
+ Tope de las 5 UF el valor de $ 101.299
+ IPC anual de 2,73. 
+*/
+
+CREATE OR REPLACE PROCEDURE SP_PRINCIPAL(P_FECHA_PROCESO IN OUT DATE, p_TOPE IN NUMBER, p_ipc in NUMBER) IS
+    -- DECLARACIÓN DE VARIABLES
+    CURSOR c1 IS SELECT * FROM PRODUCTO_INV_BK order by nro_socio asc;
+    
+    -- REGISTRO
+    reg_c1 c1%rowtype;
+    reg_reajuste REAJUSTE_PRODINV_SOCIO%ROWTYPE;
+    
+    -- Variables
+    v_cantidad_cred NUMBER(4);
+    v_cantidad_prod NUMBER(4);
+    v_monto pkg_procesos.v_reajuste%TYPE DEFAULT 0;
+    v_abono PRODUCTO_INVERSION_SOCIO.MONTO_TOTAL_AHORRADO%TYPE;
+    v_pct_inv NUMBER;
+    v_tasa NUMBER;
+    v_comando VARCHAR2(200);
+    
+    -- EXCEPCIÓN DE USUARIO
+    ex_limite EXCEPTION;
+    PRAGMA EXCEPTION_INIT(ex_limite,-20010);
+BEGIN
+    -- TRUNCAR TABLAS EN TIEMPO DE EJECUCIÓN
+    pkg_procesos.SP_TRUNCA_TABLA('REAJUSTE_PRODINV_SOCIO');
+    pkg_procesos.SP_TRUNCA_TABLA('ERROR_PROCESO');
+    
+    P_FECHA_PROCESO := ADD_MONTHS(P_FECHA_PROCESO,-12);
+    
+    FOR reg_c1 IN c1 
+    LOOP 
+        BEGIN
+            -- Cálculos
+            v_monto := 0;
+            
+           V_CANTIDAD_PROD := FN_OBTENER_TPRODUCTO(reg_c1.nro_socio);
+           
+           IF V_CANTIDAD_PROD > 1 THEN
+               v_pct_inv := 
+                        CASE v_cantidad_prod
+                            WHEN 2 THEN 0.02
+                            WHEN 3 THEN 0.03
+                            WHEN 4 THEN 0.04
+                            WHEN 5 THEN 0.05
+                            WHEN 6 THEN 0.06
+                            ELSE 
+                                0
+                        END;
+                
+                -- Asignamos el porcentaje        
+                v_monto := ROUND(reg_c1.MONTO_TOTAL_AHORRADO * v_pct_inv,0);
+                
+            ELSE
+                
+               BEGIN
+                   SELECT sum(MONTO_TOTAL_AHORRADO) INTO v_abono
+                   FROM PRODUCTO_INV_BK
+                   WHERE NRO_SOCIO = reg_c1.nro_socio
+                   GROUP BY NRO_SOCIO, TO_CHAR(FECHA_SOLIC_PROD,'YYYY')
+                   HAVING  TO_CHAR(FECHA_SOLIC_PROD,'YYYY') = TO_CHAR(p_fecha_proceso,'YYYY');
+               EXCEPTION
+                WHEN OTHERS THEN
+                    v_abono := 0;
+               END;
+               
+               
+               
+               IF  v_abono > 1000000 THEN
+                    -- Reajuste adicional 1%
+                    v_monto := ROUND(reg_c1.MONTO_TOTAL_AHORRADO * 0.01,0);
+                    
+
+               END IF;
+                         
+           END IF;
+           
+           
+
+           -- Créditos
+           v_cantidad_cred := PKG_PROCESOS.FN_CALC_CRED(reg_c1.nro_socio,p_fecha_proceso);
+           
+           
+           
+           
+           -- RESCATAMOS LA TASE DE INTERÉS ANUAL 
+           
+            IF v_cantidad_cred > 0 THEN
+                BEGIN
+                    
+                    SELECT tasa_interes_anual  INTO v_tasa
+                    FROM CREDITO WHERE cod_credito = 
+                    (SELECT COD_CREDITO 
+                    from credito_socio 
+                    WHERE nro_socio = REG_C1.NRO_SOCIO);
+                    
+                    -- Si solicitó un crédito
+                    v_monto := v_monto + ROUND(reg_c1.MONTO_TOTAL_AHORRADO * v_tasa * 0.5);
+                EXCEPTION
+                    WHEN TOO_MANY_ROWS THEN
+                        -- Tiene más de 1 un crédito
+                        v_monto := v_monto + ROUND(reg_c1.MONTO_TOTAL_AHORRADO * 0.08);
+                END;
+            ELSE
+                --  No solicitó nigún crédito
+                v_monto :=  v_monto + (p_ipc/100) *  reg_c1.MONTO_TOTAL_AHORRADO;
+                 
+            END IF;
+            
+          
+          
+
+            -- Controlamos el límite           
+            IF v_monto > P_TOPE THEN
+                BEGIN
+                    RAISE_APPLICATION_ERROR(-20010,'Socio N° : '  || reg_c1.nro_socio|| '. Solicitud producto N° : ' || reg_c1.NRO_SOLIC_PROD || '. Valor reajuste calculado : ' || v_monto);
+                EXCEPTION
+                    WHEN ex_limite THEN
+                        -- INSERTAR EN LA TABLA ERRORES 
+                        pkg_procesos.sp_errores('Tope reajuste de 5 UF', sqlerrm);
+                        v_monto := p_tope;
+                END;
+            END IF;
+            
+            reg_reajuste.NRO_SOLIC_PROD := reg_c1.NRO_SOLIC_PROD;
+            reg_reajuste.NRO_SOCIO := reg_c1.NRO_SOCIO;
+            reg_reajuste.MONTO_TOTAL_AHORRADO_SREAJ := reg_c1.MONTO_TOTAL_AHORRADO;
+            reg_reajuste.MONTO_REAJUSTE := v_monto;
+            reg_reajuste.MONTO_TOTAL_AHORRADO_CREAJ := reg_c1.MONTO_TOTAL_AHORRADO + v_monto;
+            reg_reajuste.COD_PROD_INV := reg_c1.COD_PROD_INV;
+            
+                    
+           --DBMS_OUTPUT.PUT_LINE(REG_C1.NRO_SOCIO || ' ' || V_CANTIDAD_PROD || ' ' ||v_monto || ' ' || v_cantidad_cred);
+
+            
+           
+            -- Objetivos
+            
+            v_comando := 
+            'UPDATE PRODUCTO_INV_BK set MONTO_TOTAL_AHORRADO = MONTO_TOTAL_AHORRADO + :1 
+            WHERE nro_solic_prod = :2';
+            
+            EXECUTE IMMEDIATE v_comando USING v_monto, reg_c1.nro_solic_prod;
+            
+            INSERT INTO REAJUSTE_PRODINV_SOCIO VALUES reg_reajuste;
+            
+            COMMIT;
+        
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('ERROR EN EL CURSOR' || sqlerrm);
+        END;
+    END LOOP;
+END SP_PRINCIPAL;
+/
+
+DECLARE
+    p_fecha DATE DEFAULT SYSDATE;
+BEGIN
+    -- ENTREGAMOS AL PROCESO, LA FECHA DEL PROCESO, EL VALOR DEL TOPE DE LAS 5UF Y EL IPC ANUAL
+    SP_PRINCIPAL(p_fecha, 101299,2.73);
+END;
+/
+
+SELECT * FROM REAJUSTE_PRODINV_SOCIO;
+/
+
+SELECT * FROM PRODUCTO_INV_BK ORDER BY NRO_SOCIO ASC;
+/
+
+
+
+-- CASO 2
+----------------------------------------------------------------------
+
+
+-- CREAMOS LA CABECERA DEL PACKAGE
+CREATE OR REPLACE PACKAGE PKG_CASO2 IS
+    -- VARIABLES
+    v_valor_multa NUMBER(9);
+    v_cant_dias NUMBER(2);
+    v_cursorid INTEGER;
+    v_comando VARCHAR2(500);
+    v_filas NUMBER(6);
+    
+    PROCEDURE SP_ERRORES (p_rutina_error ERROR_PROCESO.RUTINA_ERROR%TYPE, p_mensaje ERROR_PROCESO.mensaje_error%type);
+    
+    FUNCTION FN_OBT_ATRASO (P_NRO_SOLC CREDITO_SOCIO.NRO_SOLIC_CREDITO%TYPE , p_fecha_proceso IN DATE)  RETURN v_cant_dias%Type;
+    
+    FUNCTION FN_CALC_VALOR_MULTA (V_DIAS_ATRASO  NUMBER, p_valor NUMBER) RETURN v_valor_multa%Type;
+END;
+/
+
+CREATE OR REPLACE PACKAGE BODY PKG_CASO2 IS 
+
+    PROCEDURE SP_ERRORES (p_rutina_error ERROR_PROCESO.RUTINA_ERROR%TYPE, p_mensaje ERROR_PROCESO.mensaje_error%type) IS
+        v_sql VARCHAR2(100);
+    BEGIN
+        v_sql := 'INSERT INTO ERROR_PROCESO VALUES (SEQ_ERROR_PROC.NEXTVAL,:p_rutina_error,:p_mensaje)';
+        EXECUTE IMMEDIATE V_SQL USING p_rutina_error, p_mensaje;
+        
+    END SP_ERRORES;
+    
+    FUNCTION FN_OBT_ATRASO (P_NRO_SOLC CREDITO_SOCIO.NRO_SOLIC_CREDITO%TYPE , p_fecha_proceso IN DATE)  RETURN v_cant_dias%Type IS
+        v_fecha DATE;
+    BEGIN
+
+        -- Si devuelve la fila tiene atraso de pago
+        -- si no devuelve nada, no hay atraso
+
+        v_comando := '
+        SELECT fecha_venc_cuota
+        FROM CUOTA_CREDITO_sOCIO
+        WHERE (NRO_SOLIC_CREDITO = :P_NRO_SOLC AND 
+        TO_CHAR(FECHA_VENC_CUOTA, ''MM'') = TO_CHAR(add_months(:p_fecha_proceso,-1),''MM'') 
+        AND TO_CHAR(FECHA_VENC_CUOTA, ''YYYY'') = TO_CHAR(:p_fecha_proceso,''YYYY'')) AND
+         (fecha_pago_cuota IS NULL OR saldo_por_pagar <> 0)';
+    
+        -- SQL DINÁMICO
+        v_cursorid := dbms_sql.OPEN_CURSOR;        
+        DBMS_SQL.PARSE(v_cursorid, v_comando, DBMS_SQL.NATIVE);
+        DBMS_SQL.DEFINE_COLUMN(v_cursorid,1,v_fecha); -- INDICAMOS EL TIPO DE COLUMNA QUE ESPERO RECIBIR
+        DBMS_SQL.BIND_VARIABLE(v_cursorid,':p_fecha_proceso',P_fecha_proceso);
+        DBMS_SQL.BIND_VARIABLE(v_cursorid,':P_NRO_SOLC',P_NRO_SOLC);
+        v_filas := DBMS_SQL.EXECUTE(v_cursorid);
+        IF DBMS_SQL.FETCH_ROWS(v_cursorid) = 0 THEN
+            v_cant_dias := 0;
+        ELSE
+            DBMS_SQL.COLUMN_VALUE(v_cursorid,1,v_fecha);         
+            v_cant_dias := TRUNC(p_fecha_proceso) - TRUNC(v_fecha);
+        END IF;
+        
+        DBMS_SQL.CLOSE_CURSOR(v_cursorid);        
+        RETURN v_cant_dias;
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            dbms_output.put_line(SQLERRM);
+            RETURN 0;
+    END FN_OBT_ATRASO ;
+    
+    FUNCTION FN_CALC_VALOR_MULTA (V_DIAS_ATRASO  NUMBER, p_valor NUMBER) RETURN v_valor_multa%Type IS
+        v_pct_multa NUMBER;
+    BEGIN
+        v_valor_multa := 0;
+        
+        -- TABLA DE TRAMO MULTA MORA
+        v_comando := 
+        'SELECT porc_multa / 100
+        FROM multa_mora
+        WHERE :1 between tramo_dia_min_atraso 
+        AND tramo_dia_max_atraso';
+        
+        -- SQL DINÁMICO
+        v_cursorid := dbms_sql.open_cursor;
+        DBMS_SQL.PARSE(v_cursorid,v_comando,DBMS_SQL.NATIVE);
+        DBMS_SQL.DEFINE_COLUMN(v_cursorid,1,V_PCT_MULTA);
+        DBMS_SQL.BIND_VARIABLE(v_cursorid,':1',V_DIAS_ATRASO);
+        V_FILAs := dbms_sql.execute(v_cursorid);
+        IF DBMS_SQL.FETCH_ROWS(v_cursorid) = 0 THEN
+            v_pct_multa := 0;
+        ELSE
+            DBMS_SQL.COLUMN_VALUE(v_cursorid,1,v_pct_multa);
+        END IF;
+        
+        DBMS_SQL.CLOSE_CURSOR(v_cursorid);
+        
+        -- Obtenemos el porcentaje y 
+        v_valor_multa :=  ROUND(v_pct_multa * p_valor,0);
+        
+    
+        
+        RETURN v_valor_multa;
+    EXCEPTION 
+        WHEN OTHERS THEN
+            RETURN 0;
+    END FN_CALC_VALOR_MULTA;
+
+END PKG_CASO2;
+/
+
+-- FUNCIÓN ALMACENADA QUE RETORNA LA COMUNA DEL SOCIO
+CREATE OR REPLACE FUNCTION FN_COMUNA_SOCIO(p_nro_socio SOCIO.NRO_SOCIO%TYPE) RETURN COMUNA.NOMBRE_COMUNA%TYPE IS
+    V_NOMBRE COMUNA.NOMBRE_COMUNA%TYPE;
+    v_cod_region NUMBER(2);
+    v_cod_provincia NUMBER(2); 
+    v_cod_comuna NUMBER(2);
+BEGIN
+    
+    pkg_caso2.v_comando := 'SELECT COD_REGION, COD_PROVINCIA, COD_COMUNA
+                                               FROM SOCIO s
+                                               WHERE NRO_SOCIO = :1';
+                                                   
+    EXECUTE IMMEDIATE pkg_caso2.v_comando INTO v_cod_region, v_cod_provincia, v_cod_comuna USING p_nro_socio;
+    
+    pkg_caso2.v_comando := 'SELECT nombre_comuna 
+                                               FROM COMUNA
+                                               WHERE cod_comuna = :1 
+                                               AND cod_region = :2
+                                               AND cod_provincia = :3';
+    EXECUTE IMMEDIATE pkg_caso2.v_comando INTO v_nombre USING  v_cod_comuna, v_cod_region, v_cod_provincia;
+    
+    RETURN v_nombre;
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN NULL;
+END FN_COMUNA_SOCIO;
+/
+
+
+-- FUNCIÓN ALMACENADA QUE RETORNA LA PROVINCIA DEL SOCIO
+CREATE OR REPLACE FUNCTION FN_PROVINCIA_SOCIO(p_nro_socio SOCIO.NRO_SOCIO%TYPE) RETURN PROVINCIA.NOMBRE_PROVINCIA%TYPE IS
+    V_NOMBRE PROVINCIA.NOMBRE_PROVINCIA%TYPE;
+    v_cod_provincia NUMBER(2); 
+    v_cod_region NUMBER(2);
+BEGIN
+    
+    pkg_caso2.v_comando := 'SELECT COD_PROVINCIA, COD_REGION
+                                               FROM SOCIO 
+                                               WHERE NRO_SOCIO = :1';
+                                                  
+    EXECUTE IMMEDIATE pkg_caso2.v_comando 
+    INTO v_cod_provincia, v_cod_region 
+    USING p_nro_socio;
+
+    dbms_output.put_line(v_cod_provincia || ' ' || v_cod_region);     
+    pkg_caso2.v_comando := 'SELECT NOMBRE_PROVINCIA 
+                                               FROM PROVINCIA
+                                               WHERE cod_region = :1
+                                               AND cod_provincia = :2';
+                                               
+    EXECUTE IMMEDIATE pkg_caso2.v_comando 
+    INTO v_nombre 
+    USING  v_cod_region, v_cod_provincia;
+    
+    RETURN v_nombre;
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN NULL;
+END FN_PROVINCIA_SOCIO;
+/
+
+
+
+       SELECT *
+        FROM CUOTA_CREDITO_sOCIO
+        WHERE (NRO_SOLIC_CREDITO = 2004 AND 
+        TO_CHAR(FECHA_VENC_CUOTA, 'MM') = TO_CHAR(add_months(TO_DATE('01/05/2022'),-1),'MM') 
+        AND TO_CHAR(FECHA_VENC_CUOTA, 'YYYY') = TO_CHAR(TO_DATE('01/05/2022'),'YYYY')) AND
+         (fecha_pago_cuota IS NULL OR saldo_por_pagar <> 0);
+         
+
+
+-- EXECUTE DBMS_OUTPUT.PUT_LINE(FN_COMUNA_SOCIO(7));
+
+-- EXECUTE DBMS_OUTPUT.PUT_LINE(FN_PROVINCIA_SOCIO(7));
+
+EXEC DBMS_OUTPUT.PUT_LINE(PKG_CASO2.FN_OBT_ATRASO(2004,TO_DATE('01/05/2022')));
+
+-- EXECUTE DBMS_OUTPUT.PUT_LINE(PKG_CASO2.FN_CALC_VALOR_MULTA(1,100));
+
+---------------------------------------------------------------------------------------
+-- POBLAR LA TABLA PAGO_MENSUAL_CREDITO
+---------------------------------------------------------------------------------------
+
+CREATE OR REPLACE PROCEDURE SP_PRINCIPAL2(p_fecha_proceso IN DATE) IS
+    -- VARIABLE CURSOR
+    CURSOR c1 IS 
+        SELECT NRO_SOLIC_CREDITO, NRO_SOCIO, FECHA_SOLIC_CRED, 
+        FECHA_OTORGA_CRED, MONTO_SOLICITADO, 
+        MONTO_TOTAL_CREDITO, TOTAL_CUOTAS_CREDITO, COD_CREDITO
+        FROM CREDITO_SOCIO;
+        
+    -- VARIABLE REGISTRO
+    REG_PAGO PAGO_MENSUAL_CREDITO%rowtype;
+BEGIN
+
+    -- TRUNCAR EN TIEMPO DE EJECUCIÓN
+    pkg_procesos.sp_trunca_tabla('PAGO_MENSUAL_CREDITO');
+    
+    FOR x IN c1 
+    LOOP
+        BEGIN
+            
+            -- Cálculos
+            
+            
+            REG_PAGO.FECHA_PROCESO := TO_CHAR(P_FECHA_PROCESO,'MM/YYYY'); 
+            REG_PAGO.NRO_SOCIO := x.nro_socio; 
+            
+            select NUMRUN || '-' ||dvrun, DIRECCION 
+            INTO REG_PAGO.RUN_SOCIO, REG_PAGO.DIRECCION_SOCIO 
+            FROM SOCIO 
+            where nro_socio = x.nro_socio; 
+            
+            REG_PAGO.NRO_SOLIC_CREDITO := x.nro_solic_credito; 
+            
+            SELECT NOMBRE_CREDITO 
+            into REG_PAGO.TIPO_CREDITO 
+            FROM CREDITO 
+            WHERE COD_CREDITO = x.COD_CREDITO;
+            
+            REG_PAGO.MONTO_TOTAL_CREDITO := x.monto_total_Credito; 
+            REG_PAGO.NRO_TOTAL_CUOTAS := x.total_cuotas_credito; 
+            
+            BEGIN
+                SELECT NRO_CUOTA, fecha_venc_cuota, valor_cuota
+                into   REG_PAGO.NRO_CUOTA_MES, 
+                REG_PAGO.FECHA_VENC_CUOTA_MES, REG_PAGO.VALOR_CUOTA_MES 
+                FROM cuota_credito_socio 
+                where nro_solic_credito = X.NRO_SOLIC_CREDITO 
+                AND fecha_pago_cuota IS NULL
+                FETCH FIRST 1 ROWS ONLY;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    DBMS_OUTPUT.PUT_LINE('UWU');
+            END;
+            
+            BEGIN
+                SELECT SALDO_POR_PAGAR
+                INTO REG_PAGO.SALDO_PAGO_MES_ANT 
+                FROM cuota_credito_socio 
+                where NRO_SOLIC_CREDITO = X.NRO_SOLIC_CREDITO 
+                AND TO_CHAR(FECHA_VENC_CUOTA,'MM/YYYY') = TO_CHAR(ADD_MONTHS(p_fecha_proceso,-1),'MM/YYYY');
+            EXCEPTION
+                WHEN OTHERS THEN
+                    REG_PAGO.SALDO_PAGO_MES_ANT := 0;
+                    DBMS_OUTPUT.PUT_LINE('SALDO');
+            END;
+            
+            
+            pkg_caso2.v_cant_dias := pkg_caso2.fn_obt_atraso(x.NRO_SOLIC_CREDITO,p_fecha_proceso);
+            
+            REG_PAGO.DIAS_ATRASO_PAGO_MES_ANT := pkg_caso2.v_cant_dias;
+            REG_PAGO.MULTA_ATRASO_PAGO_MES_ANT := pkg_caso2.fn_calc_valor_multa(pkg_caso2.v_cant_dias,x.monto_solicitado); 
+            REG_PAGO.VALOR_REBAJA_65_ANNOS := 0; 
+            REG_PAGO.VALOR_TOTAL_CUOTA_MES := 0; 
+            
+            SELECT FECHA_VENC_CUOTA 
+            into REG_PAGO.FECHA_VENC_ULT_CUOTA 
+            FROM cuota_credito_socio 
+            where NRO_SOLIC_CREDITO = X.NRO_SOLIC_CREDITO
+            ORDER BY NRO_CUOTA DESC
+            FETCH FIRST 1 ROWS ONLY;
+            
+            
+            -- Objetivo
+            insert into PAGO_MENSUAL_CREDITO values reg_pago;        
+            COMMIT;
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('Error en el cursor ' || SQLERRM);
+        END;
+    END LOOP;
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE(SQLERRM);
+END SP_PRINCIPAL2;
+/
+
+
+
+EXECUTE SP_PRINCIPAL2(TO_DATE('01/05/2022'));
+/
+
+SELECT * FROM pago_mensual_credito
+where nro_socio in (14,67, 27);
+
